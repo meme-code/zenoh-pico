@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>zenoh-pico browser test</title>
+</head>
+<body>
+<pre id="out"></pre>
+<script type="module">
+// End-to-end test of zenoh-pico.wasm against a real router, driven by tests/run-browser-test.mjs.
+// Two sessions in this page talk to each other through the router.
+// Reports a single console line: "RESULT {json}".
+import { Session } from './zenoh.js';
+
+const params = new URLSearchParams(location.search);
+const connect = params.get('connect') ?? 'ws/127.0.0.1:10000';
+const checks = [];
+const metrics = {};
+
+function check(name, ok, detail = '') {
+  checks.push({ name, ok: !!ok, detail: String(detail) });
+  document.getElementById('out').textContent += `${ok ? 'PASS' : 'FAIL'} ${name} ${detail}\n`;
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function waitUntil(cond, ms) {
+  const end = performance.now() + ms;
+  while (!cond() && performance.now() < end) await sleep(10);
+  return cond();
+}
+
+async function main() {
+  check('page is cross-origin isolated', crossOriginIsolated);
+
+  let t0 = performance.now();
+  const a = await Session.open({ connect });
+  metrics.openMs = Math.round(performance.now() - t0);
+  const b = await Session.open({ connect });
+  check('two sessions opened', a.zid && b.zid, `${a.zid} ${b.zid}`);
+  check('session ids differ', a.zid !== b.zid);
+  // zw_zid prints the last byte first, so an id with only its first byte random looks like 000…0xx.
+  check('session ids are random beyond the first byte', /^[0-9a-f]{32}$/.test(a.zid) && !/^0{16}/.test(a.zid), a.zid);
+
+  // Pub/sub through the router: put, publisher, delete, binary payloads, fragmentation.
+  const received = [];
+  const sub = await b.declareSubscriber('test/**', (s) => received.push(s));
+  await sleep(200); // let the declaration reach the router
+
+  const N = 50;
+  for (let i = 0; i < N; i++) await a.put(`test/put/${i}`, `message ${i}`, { encoding: 'text/plain' });
+  await waitUntil(() => received.length >= N, 5000);
+  check(`subscriber got ${N} puts in order`, received.length === N &&
+        received.every((s, i) => s.keyexpr === `test/put/${i}` && s.text() === `message ${i}` && s.kind === 'put'),
+        `${received.length} received`);
+  check('encoding is carried', received[0]?.encoding === 'text/plain', received[0]?.encoding);
+
+  received.length = 0;
+  const pub = await a.declarePublisher('test/pub');
+  // zenoh-pico drops a publisher's puts until the router reports a matching subscriber
+  // (write filter starts active), which is processed on a later spin.
+  await sleep(200);
+  const binary = new Uint8Array(256).map((_, i) => i);
+  await pub.put(binary);
+  await a.delete('test/deleted');
+  const big = new Uint8Array(3000).map((_, i) => (i * 7) & 0xff); // > batch size: fragmented
+  await a.put('test/big', big);
+  await waitUntil(() => received.length >= 3, 5000);
+  const byKey = Object.fromEntries(received.map((s) => [s.keyexpr, s]));
+  check('publisher binary payload intact', byKey['test/pub']?.payload.length === 256 && byKey['test/pub'].payload.every((v, i) => v === binary[i]),
+        `received keys: ${Object.keys(byKey).join(', ')}`);
+  check('delete delivered as delete', byKey['test/deleted']?.kind === 'delete');
+  check('fragmented 3000-byte payload intact', byKey['test/big']?.payload.length === 3000 && byKey['test/big'].payload.every((v, i) => v === big[i]),
+        byKey['test/big']?.payload.length);
+
+  // Round-trip latency: a pings, b answers from its subscriber callback.
+  const pongs = [];
+  await b.declareSubscriber('rtt/ping', (s) => b.put('rtt/pong', s.payload));
+  await a.declareSubscriber('rtt/pong', (s) => pongs.push(performance.now()));
+  await sleep(200);
+  const ROUNDS = 100;
+  const rtts = [];
+  for (let i = 0; i < ROUNDS; i++) {
+    const start = performance.now();
+    const before = pongs.length;
+    await a.put('rtt/ping', String(i));
+    if (!(await waitUntil(() => pongs.length > before, 2000))) break;
+    rtts.push(pongs[pongs.length - 1] - start);
+  }
+  rtts.sort((x, y) => x - y);
+  check(`${ROUNDS} ping/pong round trips`, rtts.length === ROUNDS, rtts.length);
+  if (rtts.length) {
+    metrics.rttMedianMs = +rtts[rtts.length >> 1].toFixed(2);
+    metrics.rttP95Ms = +rtts[Math.floor(rtts.length * 0.95)].toFixed(2);
+  }
+
+  // Throughput: a fires puts without waiting for b.
+  received.length = 0;
+  const M = 2000;
+  t0 = performance.now();
+  const puts = [];
+  for (let i = 0; i < M; i++) puts.push(a.put('test/burst', 'x'.repeat(64)));
+  await Promise.all(puts);
+  await waitUntil(() => received.length >= M, 10000);
+  metrics.burstMsgs = received.length;
+  metrics.burstMsgPerSec = Math.round(received.length / ((performance.now() - t0) / 1000));
+  check(`burst of ${M} puts delivered`, received.length === M, received.length);
+
+  // Query: the router's in-memory storage on demo/** (configured by the test driver) answers.
+  await a.put('demo/stored', 'kept by the router');
+  await sleep(300);
+  const replies = await b.get('demo/**', { timeoutMs: 3000 });
+  check('get returns the stored value', replies.some((r) => r.ok && r.keyexpr === 'demo/stored' && r.text() === 'kept by the router'),
+        JSON.stringify(replies.map((r) => [r.ok, r.keyexpr, r.text()])));
+
+  await sub.undeclare();
+  received.length = 0;
+  await a.put('test/after-undeclare', 'nobody listens');
+  await sleep(300);
+  check('undeclared subscriber gets nothing', received.length === 0, received.length);
+
+  await pub.undeclare();
+  await a.close();
+  await b.close();
+  check('sessions closed', true);
+}
+
+try {
+  await main();
+} catch (err) {
+  check('no exception', false, err?.stack ?? err);
+}
+console.log('RESULT ' + JSON.stringify({ ok: checks.every((c) => c.ok), checks, metrics }));
+</script>
+</body>
+</html>

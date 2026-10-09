@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>zenoh-pico in the browser</title>
+<style>
+  :root {
+    --bg: #f7f7f5; --panel: #ffffff; --text: #1d1d1b; --muted: #6b6b66; --line: #dcdcd6;
+    --accent: #2f5bd3; --ok: #1d7a46; --err: #b3261e;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #151514; --panel: #1f1f1d; --text: #ececea; --muted: #9a9a94; --line: #34342f;
+      --accent: #7d9bff; --ok: #5cc48a; --err: #ff8a80;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.45 system-ui, sans-serif; }
+  main { max-width: 860px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 1.35rem; margin: 0 0 4px; }
+  p.sub { color: var(--muted); margin: 0 0 20px; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; margin-bottom: 12px; }
+  h2 { font-size: .8rem; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 10px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; }
+  input { flex: 1 1 180px; min-width: 0; padding: 7px 9px; border: 1px solid var(--line); border-radius: 6px;
+          background: var(--bg); color: var(--text); font: 14px ui-monospace, SFMono-Regular, Menlo, monospace; }
+  button { padding: 7px 14px; border: 0; border-radius: 6px; background: var(--accent); color: #fff; font: inherit; cursor: pointer; }
+  button:disabled { opacity: .45; cursor: default; }
+  #status { font-size: .9rem; color: var(--muted); margin-top: 8px; overflow-wrap: anywhere; }
+  #status.ok { color: var(--ok); } #status.err { color: var(--err); }
+  #log { height: 300px; overflow: auto; margin: 0; font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+         white-space: pre-wrap; overflow-wrap: anywhere; }
+  #log .t { color: var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <h1>zenoh-pico in the browser</h1>
+  <p class="sub">zenoh-pico compiled to WebAssembly with Zig, talking to a zenoh router over WebSocket.</p>
+
+  <section>
+    <h2>Session</h2>
+    <div class="row">
+      <input id="connect" value="ws/127.0.0.1:10000" aria-label="Router locator">
+      <button id="open">Connect</button>
+      <button id="close" disabled>Disconnect</button>
+    </div>
+    <div id="status">Not connected. Start a router with: zenohd -l ws/127.0.0.1:10000</div>
+  </section>
+
+  <section>
+    <h2>Subscribe</h2>
+    <div class="row">
+      <input id="subKey" value="demo/example/**" aria-label="Subscriber key expression">
+      <button id="sub" disabled>Subscribe</button>
+    </div>
+  </section>
+
+  <section>
+    <h2>Publish</h2>
+    <div class="row">
+      <input id="pubKey" value="demo/example/browser" aria-label="Publication key expression">
+      <input id="pubValue" value="Hello from the browser!" aria-label="Payload">
+      <button id="pub" disabled>Put</button>
+    </div>
+  </section>
+
+  <section>
+    <h2>Query</h2>
+    <div class="row">
+      <input id="getKey" value="demo/example/**" aria-label="Query key expression">
+      <button id="get" disabled>Get</button>
+    </div>
+  </section>
+
+  <section>
+    <h2>Log</h2>
+    <pre id="log"></pre>
+  </section>
+</main>
+
+<script type="module">
+import { Session } from './zenoh.js';
+
+const $ = (id) => document.getElementById(id);
+let session = null;
+
+function log(text) {
+  const line = document.createElement('div');
+  const t = document.createElement('span');
+  t.className = 't';
+  t.textContent = new Date().toLocaleTimeString() + '  ';
+  line.append(t, text);
+  $('log').prepend(line);
+}
+
+function setStatus(text, cls = '') {
+  $('status').textContent = text;
+  $('status').className = cls;
+}
+
+function setConnected(on) {
+  $('open').disabled = on;
+  $('close').disabled = !on;
+  for (const id of ['sub', 'pub', 'get']) $(id).disabled = !on;
+}
+
+async function run(what, fn) {
+  try {
+    await fn();
+  } catch (err) {
+    log(`${what}: ${err.message}`);
+    console.error(err);
+  }
+}
+
+$('open').onclick = () => run('connect', async () => {
+  $('open').disabled = true;
+  setStatus('Connecting…');
+  try {
+    session = await Session.open({ connect: $('connect').value.trim() });
+  } catch (err) {
+    setStatus(err.message, 'err');
+    $('open').disabled = false;
+    throw err;
+  }
+  session.onclose = () => {
+    setStatus('Session closed by the network.', 'err');
+    setConnected(false);
+    session = null;
+  };
+  setStatus(`Connected, session id ${session.zid}`, 'ok');
+  setConnected(true);
+});
+
+$('close').onclick = () => run('disconnect', async () => {
+  await session?.close();
+  session = null;
+  setConnected(false);
+  setStatus('Disconnected.');
+});
+
+$('sub').onclick = () => run('subscribe', async () => {
+  const key = $('subKey').value.trim();
+  await session.declareSubscriber(key, (s) => log(`[sub] ${s.kind} ${s.keyexpr}: ${s.text()}`));
+  log(`subscribed to ${key}`);
+});
+
+$('pub').onclick = () => run('put', async () => {
+  const key = $('pubKey').value.trim();
+  await session.put(key, $('pubValue').value, { encoding: 'text/plain' });
+  log(`put ${key}`);
+});
+
+$('get').onclick = () => run('get', async () => {
+  const key = $('getKey').value.trim();
+  const replies = await session.get(key);
+  log(`get ${key}: ${replies.length} repl${replies.length === 1 ? 'y' : 'ies'}`);
+  for (const r of replies) log(`  ${r.ok ? r.keyexpr : 'error'}: ${r.text()}`);
+});
+
+if (!crossOriginIsolated) {
+  setStatus('This page is not cross-origin isolated; serve it with `zig build serve`.', 'err');
+  $('open').disabled = true;
+}
+</script>
+</body>
+</html>

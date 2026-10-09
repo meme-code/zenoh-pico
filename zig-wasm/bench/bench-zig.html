@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>zenoh-pico bench: Zig</title>
+</head>
+<body>
+<script type="module">
+// Runs bench/bench.c inside this port's worker; zenoh.js logs its output (BENCH/READY/...) here.
+import { Session } from './zenoh.js';
+
+const p = new URLSearchParams(location.search);
+const runtime = await Session._spawn({ wasmUrl: new URL('./zenoh-pico-bench.wasm', location.href) });
+try {
+  await runtime._call('bench', 'bench', p.get('connect'), p.get('mode'), Number(p.get('n')), Number(p.get('size')));
+} catch (err) {
+  console.error('bench failed', err);
+}
+await runtime.close();
+</script>
+</body>
+</html>

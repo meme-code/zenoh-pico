@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>zenoh-pico bench: Emscripten</title>
+</head>
+<body>
+<script>
+// Runs bench/bench.c built with Emscripten against zenoh-pico's in-tree Emscripten port.
+const p = new URLSearchParams(location.search);
+var Module = {
+  arguments: [p.get('connect'), p.get('mode'), p.get('n'), p.get('size')],
+  print: (text) => console.log(text),
+  printErr: (text) => console.error(text),
+};
+</script>
+<script src="emscripten/bench-emscripten.js"></script>
+</body>
+</html>
