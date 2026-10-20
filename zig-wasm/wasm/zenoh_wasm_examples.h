@@ -3,6 +3,7 @@
 //
 // z_info.c calls z_whatami_to_view_string() under Z_FEATURE_CONNECTIVITY, but upstream only
 // declares it with Z_FEATURE_SCOUTING, which browsers cannot have. wasm/system.c defines it.
+// eclipse-zenoh/zenoh-pico#1341
 //
 
 #ifndef ZENOH_WASM_EXAMPLES_H

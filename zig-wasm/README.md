@@ -231,10 +231,16 @@ Without it, Chrome rejects the WebSocket handshake and `z_open` hangs with no er
    pointer (`src/collections/list.c`, `NODE_DATA_SIZE`), so 8-byte-aligned structs are misaligned.
    This affects wasm32, 32-bit ARM and RV32. UBSan reports it in Debug builds. No misbehavior has
    been seen: wasm allows unaligned access, so the Debug build disables only `-fsanitize=alignment`.
-3. Not filed yet: `z_whatami_to_view_string` is declared only with `Z_FEATURE_SCOUTING`, but
-   `examples/unix/c11/z_info.c` uses it with `Z_FEATURE_CONNECTIVITY` alone (worked around in
-   `wasm/zenoh_wasm_examples.h`); the Emscripten single-threaded build misses `size_t` in
-   `platform.h`; Emscripten's default WebSocket subprotocol breaks the handshake with `zenohd`.
+3. **`platform.h` uses `size_t` without `<stddef.h>`**
+   ([#1339](https://github.com/eclipse-zenoh/zenoh-pico/issues/1339)), so the single-threaded Emscripten
+   build fails (`bench/build-emscripten.sh` works around it).
+4. **Emscripten: `z_open()` hangs against `zenohd`**
+   ([#1340](https://github.com/eclipse-zenoh/zenoh-pico/issues/1340)): Emscripten's WebSockets request the
+   `binary` subprotocol, `zenohd` doesn't answer with one, and the browser fails the handshake. Needs
+   `-sWEBSOCKET_SUBPROTOCOL=null`.
+5. **`z_info.c` doesn't compile with `Z_FEATURE_CONNECTIVITY=1` and `Z_FEATURE_SCOUTING=0`**
+   ([#1341](https://github.com/eclipse-zenoh/zenoh-pico/issues/1341)): `z_whatami_to_view_string` is
+   scouting-only. Worked around for the browser examples in `wasm/zenoh_wasm_examples.h`.
 
 ## Benchmarks
 
