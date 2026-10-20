@@ -20,6 +20,8 @@
   main { max-width: 860px; margin: 0 auto; padding: 24px 16px 48px; }
   h1 { font-size: 1.35rem; margin: 0 0 4px; }
   p.sub { color: var(--muted); margin: 0 0 20px; }
+  a { color: var(--accent); }
+  label { display: flex; gap: 6px; align-items: center; color: var(--muted); font-size: .9rem; }
   section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; margin-bottom: 12px; }
   h2 { font-size: .8rem; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 10px; }
   .row { display: flex; gap: 8px; flex-wrap: wrap; }
@@ -37,7 +39,8 @@
 <body>
 <main>
   <h1>zenoh-pico in the browser</h1>
-  <p class="sub">zenoh-pico compiled to WebAssembly with Zig, talking to a zenoh router over WebSocket.</p>
+  <p class="sub">zenoh-pico compiled to WebAssembly with Zig, talking to a zenoh router over WebSocket.
+    The upstream C examples run here too: <a href="examples.html">examples.html</a></p>
 
   <section>
     <h2>Session</h2>
@@ -45,6 +48,7 @@
       <input id="connect" value="ws/127.0.0.1:10000" aria-label="Router locator">
       <button id="open">Connect</button>
       <button id="close" disabled>Disconnect</button>
+      <label><input id="threads" type="checkbox"> threads</label>
     </div>
     <div id="status">Not connected. Start a router with: zenohd -l ws/127.0.0.1:10000</div>
   </section>
@@ -71,6 +75,24 @@
     <div class="row">
       <input id="getKey" value="demo/example/**" aria-label="Query key expression">
       <button id="get" disabled>Get</button>
+    </div>
+  </section>
+
+  <section>
+    <h2>Queryable</h2>
+    <div class="row">
+      <input id="qKey" value="demo/example/browser-queryable" aria-label="Queryable key expression">
+      <input id="qValue" value="Answered by the browser" aria-label="Reply payload">
+      <button id="queryable" disabled>Declare</button>
+    </div>
+  </section>
+
+  <section>
+    <h2>Liveliness</h2>
+    <div class="row">
+      <input id="lKey" value="group1/browser" aria-label="Liveliness token key expression">
+      <button id="token" disabled>Declare token</button>
+      <button id="alive" disabled>Who is alive (group1/**)?</button>
     </div>
   </section>
 
@@ -103,7 +125,8 @@ function setStatus(text, cls = '') {
 function setConnected(on) {
   $('open').disabled = on;
   $('close').disabled = !on;
-  for (const id of ['sub', 'pub', 'get']) $(id).disabled = !on;
+  for (const id of ['sub', 'pub', 'get', 'queryable', 'token', 'alive']) $(id).disabled = !on;
+  $('threads').disabled = on;
 }
 
 async function run(what, fn) {
@@ -119,7 +142,7 @@ $('open').onclick = () => run('connect', async () => {
   $('open').disabled = true;
   setStatus('Connecting…');
   try {
-    session = await Session.open({ connect: $('connect').value.trim() });
+    session = await Session.open({ connect: $('connect').value.trim(), threads: $('threads').checked });
   } catch (err) {
     setStatus(err.message, 'err');
     $('open').disabled = false;
@@ -130,7 +153,7 @@ $('open').onclick = () => run('connect', async () => {
     setConnected(false);
     session = null;
   };
-  setStatus(`Connected, session id ${session.zid}`, 'ok');
+  setStatus(`Connected${session.threads ? ' (threads)' : ''}, session id ${session.zid}`, 'ok');
   setConnected(true);
 });
 
@@ -158,6 +181,27 @@ $('get').onclick = () => run('get', async () => {
   const replies = await session.get(key);
   log(`get ${key}: ${replies.length} repl${replies.length === 1 ? 'y' : 'ies'}`);
   for (const r of replies) log(`  ${r.ok ? r.keyexpr : 'error'}: ${r.text()}`);
+});
+
+$('queryable').onclick = () => run('queryable', async () => {
+  const key = $('qKey').value.trim();
+  const value = $('qValue').value;
+  await session.declareQueryable(key, async (query) => {
+    log(`[queryable] query on ${query.keyexpr}${query.parameters ? `?${query.parameters}` : ''}`);
+    await query.reply(key, value, { encoding: 'text/plain' });
+  });
+  log(`queryable on ${key}`);
+});
+
+$('token').onclick = () => run('liveliness token', async () => {
+  const key = $('lKey').value.trim();
+  await session.liveliness.declareToken(key);
+  log(`liveliness token ${key}`);
+});
+
+$('alive').onclick = () => run('liveliness get', async () => {
+  const replies = await session.liveliness.get('group1/**');
+  log(`alive: ${replies.map((r) => r.keyexpr).join(', ') || 'nobody'}`);
 });
 
 if (!crossOriginIsolated) {

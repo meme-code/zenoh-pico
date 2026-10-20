@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>zenoh-pico C examples</title>
+<style>
+  :root {
+    --bg: #f7f7f5; --panel: #ffffff; --text: #1d1d1b; --muted: #6b6b66; --line: #dcdcd6;
+    --accent: #2f5bd3; --ok: #1d7a46; --err: #b3261e;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #151514; --panel: #1f1f1d; --text: #ececea; --muted: #9a9a94; --line: #34342f;
+      --accent: #7d9bff; --ok: #5cc48a; --err: #ff8a80;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.45 system-ui, sans-serif; }
+  main { max-width: 960px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 1.35rem; margin: 0 0 4px; }
+  p.sub { color: var(--muted); margin: 0 0 20px; }
+  a { color: var(--accent); }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; margin-bottom: 12px; }
+  h2 { font-size: .8rem; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 10px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  input, select { flex: 1 1 180px; min-width: 0; padding: 7px 9px; border: 1px solid var(--line); border-radius: 6px;
+          background: var(--bg); color: var(--text); font: 14px ui-monospace, SFMono-Regular, Menlo, monospace; }
+  select { flex: 0 1 220px; }
+  button { padding: 7px 14px; border: 0; border-radius: 6px; background: var(--accent); color: #fff; font: inherit; cursor: pointer; }
+  button.quiet { background: transparent; color: var(--accent); border: 1px solid var(--line); }
+  button:disabled { opacity: .45; cursor: default; }
+  .head { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; flex-wrap: wrap; margin-bottom: 8px; }
+  .cmd { font: 13px ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
+  .state { font-size: .85rem; color: var(--muted); }
+  .state.ok { color: var(--ok); } .state.err { color: var(--err); }
+  pre { height: 220px; overflow: auto; margin: 0 0 8px; padding: 8px; background: var(--bg); border-radius: 6px;
+        font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+  pre .e { color: var(--err); }
+  #hint { color: var(--muted); font-size: .9rem; margin-top: 8px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>zenoh-pico C examples in the browser</h1>
+  <p class="sub">The upstream examples (examples/unix/c11), unmodified, built with Zig for wasm32-wasi with real
+    threads. Each runs in its own Web Workers; stdout and stderr show up below. <a href="index.html">JavaScript API demo</a></p>
+
+  <section>
+    <h2>Run</h2>
+    <div class="row">
+      <select id="program" aria-label="Example"></select>
+      <input id="args" value="-e ws/127.0.0.1:10000" aria-label="Arguments">
+      <button id="run">Run</button>
+    </div>
+    <div id="hint">Start a router with <code>zenohd -l ws/127.0.0.1:10000</code>. Try z_sub, then z_pub;
+      z_queryable, then z_get; z_pong, then z_ping (send <code>q</code> to z_pong to stop it).</div>
+  </section>
+
+  <div id="runs"></div>
+</main>
+
+<script type="module">
+import { runProgram } from './zenoh.js';
+
+const $ = (id) => document.getElementById(id);
+
+const names = await (await fetch('examples/index.json')).json();
+for (const name of names) $('program').append(new Option(name, name));
+$('program').value = names.includes('z_sub') ? 'z_sub' : names[0];
+
+// Splits an argument string like a shell would for simple cases: spaces, '…' and "…" quotes.
+function splitArgs(text) {
+  const args = [];
+  for (const m of text.matchAll(/"([^"]*)"|'([^']*)'|(\S+)/g)) args.push(m[1] ?? m[2] ?? m[3]);
+  return args;
+}
+
+$('run').onclick = async () => {
+  const name = $('program').value;
+  const args = splitArgs($('args').value);
+  const card = document.createElement('section');
+  card.innerHTML = `
+    <div class="head"><span class="cmd"></span><span class="state">starting…</span></div>
+    <pre></pre>
+    <div class="row">
+      <input class="stdin" placeholder="stdin" aria-label="Standard input">
+      <button class="send quiet">Send line</button>
+      <button class="stop">Stop</button>
+      <button class="remove quiet">Remove</button>
+    </div>`;
+  card.querySelector('.cmd').textContent = [name, ...args].join(' ');
+  $('runs').prepend(card);
+  const out = card.querySelector('pre');
+  const state = card.querySelector('.state');
+  const print = (line, cls = '') => {
+    const div = document.createElement('div');
+    if (cls) div.className = cls;
+    div.textContent = line;
+    const atEnd = out.scrollTop + out.clientHeight >= out.scrollHeight - 4;
+    out.append(div);
+    if (atEnd) out.scrollTop = out.scrollHeight;
+  };
+  let program;
+  try {
+    program = await runProgram({
+      wasmUrl: `examples/${name}.wasm`,
+      args,
+      onStdout: (line) => print(line),
+      onStderr: (line) => print(line, 'e'),
+    });
+  } catch (err) {
+    state.textContent = err.message;
+    state.className = 'state err';
+    return;
+  }
+  state.textContent = 'running';
+  const send = () => {
+    program.stdin.write(`${card.querySelector('.stdin').value}\n`);
+    card.querySelector('.stdin').value = '';
+  };
+  card.querySelector('.send').onclick = send;
+  card.querySelector('.stdin').onkeydown = (ev) => ev.key === 'Enter' && send();
+  card.querySelector('.stop').onclick = () => program.kill();
+  card.querySelector('.remove').onclick = () => {
+    program.kill();
+    card.remove();
+  };
+  const code = await program.exited;
+  state.textContent = code === 137 ? 'stopped' : `exited with ${code}`;
+  state.className = `state ${code === 0 ? 'ok' : code === 137 ? '' : 'err'}`;
+  for (const b of card.querySelectorAll('.send, .stop')) b.disabled = true;
+};
+
+if (!crossOriginIsolated) {
+  $('hint').textContent = 'This page is not cross-origin isolated; serve it with `zig build serve`.';
+  $('run').disabled = true;
+}
+</script>
+</body>
+</html>

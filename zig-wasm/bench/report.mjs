@@ -61,7 +61,7 @@ out();
 
 // --- in-page metrics
 const inpage = readFileSync(join(resultsDir, 'inpage.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l))
-    .filter((r) => r.iteration === null || !String(r.iteration).startsWith('warmup'));
+    .filter((r) => !r.error && (r.iteration === null || !String(r.iteration).startsWith('warmup')));
 const pick = (port, mode, f) => inpage.filter((r) => r.port === port && r.mode === mode).map(f).filter(Number.isFinite);
 
 out('## Inside the page');

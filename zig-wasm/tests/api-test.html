@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>zenoh-pico API test</title>
+</head>
+<body>
+<pre id="out"></pre>
+<script type="module">
+// The rest of the JS API (queryables, liveliness, queriers, matching, attachments, QoS, info,
+// key expressions), with two sessions in this page talking through a real router.
+// Driven by tests/run-browser-test.mjs; reports a single console line: "RESULT {json}".
+import { Session } from './zenoh.js';
+
+const params = new URLSearchParams(location.search);
+const connect = params.get('connect') ?? 'ws/127.0.0.1:10000';
+const threads = params.get('threads') === '1';
+const checks = [];
+
+function check(name, ok, detail = '') {
+  checks.push({ name, ok: !!ok, detail: String(detail) });
+  document.getElementById('out').textContent += `${ok ? 'PASS' : 'FAIL'} ${name} ${detail}\n`;
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const text = (bytes) => (bytes ? new TextDecoder().decode(bytes) : null);
+
+async function waitUntil(cond, ms) {
+  const end = performance.now() + ms;
+  while (!cond() && performance.now() < end) await sleep(10);
+  return cond();
+}
+
+async function main() {
+  const a = await Session.open({ connect, threads });
+  const b = await Session.open({ connect, threads });
+  check(`sessions use ${threads ? 'threads' : 'one thread'}`, a.threads === threads && b.threads === threads);
+
+  // Queryable answering from JavaScript, asynchronously, with several replies.
+  const seen = [];
+  const queryable = await b.declareQueryable('api/q/**', async (query) => {
+    seen.push({ keyexpr: query.keyexpr, parameters: query.parameters, payload: query.text(), attachment: text(query.attachment) });
+    await sleep(20); // replies may come later than the callback
+    await query.reply('api/q/one', `one for ${query.parameters}`, { encoding: 'text/plain', attachment: 'meta-1' });
+    await query.reply('api/q/two', new Uint8Array([1, 2, 3]));
+  });
+  await sleep(200);
+  const replies = await a.get('api/q/**', { parameters: 'x=1', payload: 'question', attachment: 'ask', timeoutMs: 3000 });
+  check('queryable saw the query', seen.length === 1 && seen[0].parameters === 'x=1' && seen[0].payload === 'question' &&
+        seen[0].attachment === 'ask', JSON.stringify(seen));
+  const byKey = Object.fromEntries(replies.map((r) => [r.keyexpr, r]));
+  check('get received both replies', replies.length === 2 && replies.every((r) => r.ok), replies.map((r) => r.keyexpr));
+  check('reply payload, encoding and attachment', byKey['api/q/one']?.text() === 'one for x=1' &&
+        byKey['api/q/one']?.encoding === 'text/plain' && text(byKey['api/q/one']?.attachment) === 'meta-1',
+        JSON.stringify(byKey['api/q/one'] && [byKey['api/q/one'].text(), byKey['api/q/one'].encoding]));
+  check('binary reply intact', byKey['api/q/two']?.payload.join() === '1,2,3');
+
+  // Error replies.
+  const errQueryable = await b.declareQueryable('api/err', (query) => query.replyErr('no such thing', { encoding: 'text/plain' }));
+  await sleep(200);
+  const errReplies = await a.get('api/err', { timeoutMs: 3000 });
+  check('error reply', errReplies.length === 1 && !errReplies[0].ok && errReplies[0].text() === 'no such thing',
+        JSON.stringify(errReplies.map((r) => [r.ok, r.text()])));
+
+  // Querier.
+  const querier = await a.declareQuerier('api/q/**', { timeoutMs: 3000, target: 'all', consolidation: 'none' });
+  await sleep(300); // like publishers, queriers send nothing until the router reports a match
+  const qReplies = await querier.get('y=2');
+  check('querier get', qReplies.length === 2 && qReplies.some((r) => r.text() === 'one for y=2'),
+        JSON.stringify(qReplies.map((r) => r.text())));
+  await querier.undeclare();
+  await errQueryable.undeclare();
+  await queryable.undeclare();
+
+  // Attachments and QoS on samples.
+  const samples = [];
+  const sub = await b.declareSubscriber('api/s/**', (s) => samples.push(s));
+  await sleep(200);
+  await a.put('api/s/1', 'with attachment', { attachment: 'att', priority: 'real-time', congestionControl: 'block', express: true });
+  const pub = await a.declarePublisher('api/s/2', { encoding: 'application/json', priority: 'data-high' });
+  await sleep(300);
+  await pub.put('{"n":1}', { attachment: new Uint8Array([9]) });
+  await waitUntil(() => samples.length >= 2, 3000);
+  const s1 = samples.find((s) => s.keyexpr === 'api/s/1');
+  const s2 = samples.find((s) => s.keyexpr === 'api/s/2');
+  check('put attachment', text(s1?.attachment) === 'att', text(s1?.attachment));
+  check('put QoS', s1?.priority === 'real-time' && s1?.congestionControl === 'block' && s1?.express === true,
+        JSON.stringify(s1 && [s1.priority, s1.congestionControl, s1.express]));
+  check('publisher encoding, attachment and priority', s2?.encoding === 'application/json' && s2?.attachment?.join() === '9' &&
+        s2?.priority === 'data-high', JSON.stringify(s2 && [s2.encoding, s2.priority]));
+  await pub.delete();
+  await waitUntil(() => samples.some((s) => s.kind === 'delete'), 3000);
+  check('publisher delete', samples.some((s) => s.kind === 'delete' && s.keyexpr === 'api/s/2'));
+  await pub.undeclare();
+
+  // Matching: a publisher learns when subscribers come and go.
+  const lonely = await a.declarePublisher('api/m/x');
+  const events = [];
+  const listener = await lonely.declareMatchingListener((m) => events.push(m));
+  await sleep(300);
+  const before = await lonely.matchingStatus();
+  const msub = await b.declareSubscriber('api/m/**', () => {});
+  await waitUntil(() => events.includes(true), 3000);
+  const during = await lonely.matchingStatus();
+  await msub.undeclare();
+  await waitUntil(() => events.at(-1) === false, 3000);
+  check('matching status follows subscribers', before === false && during === true, `${before} ${during}`);
+  check('matching listener events', events.join() === 'true,false', events.join());
+  await listener.undeclare();
+  await lonely.undeclare();
+
+  // Liveliness.
+  const alive = [];
+  const lsub = await b.liveliness.declareSubscriber('api/alive/**', (s) => alive.push(`${s.kind} ${s.keyexpr}`));
+  await sleep(200);
+  const token = await a.liveliness.declareToken('api/alive/a');
+  await waitUntil(() => alive.length >= 1, 3000);
+  const present = await b.liveliness.get('api/alive/**', { timeoutMs: 2000 });
+  await token.undeclare();
+  await waitUntil(() => alive.includes('delete api/alive/a'), 3000);
+  // zenoh-pico may report the token twice: the liveliness get above re-announces it.
+  check('liveliness subscriber sees the token come and go',
+        alive[0] === 'put api/alive/a' && alive.at(-1) === 'delete api/alive/a', alive.join());
+  check('liveliness get finds the token', present.length === 1 && present[0].keyexpr === 'api/alive/a',
+        JSON.stringify(present.map((r) => r.keyexpr)));
+  const t2 = await a.liveliness.declareToken('api/alive/b');
+  await sleep(300);
+  const history = [];
+  const hsub = await b.liveliness.declareSubscriber('api/alive/**', (s) => history.push(s.keyexpr), { history: true });
+  await waitUntil(() => history.length >= 1, 3000);
+  check('liveliness history', history.includes('api/alive/b'), history.join());
+  await hsub.undeclare();
+  await t2.undeclare();
+  await lsub.undeclare();
+  await sub.undeclare();
+
+  // Local delivery: a session's own subscriber and queryable see its own put and get.
+  const own = [];
+  const ownSub = await a.declareSubscriber('api/local/**', (s) => own.push(s.text()));
+  const ownQ = await a.declareQueryable('api/local/q', (q) => q.reply('api/local/q', 'from myself'));
+  await a.put('api/local/x', 'to myself');
+  await waitUntil(() => own.length >= 1, 3000);
+  const ownReplies = await a.get('api/local/q', { timeoutMs: 2000 });
+  check('own subscriber gets own put', own.join() === 'to myself', own.join());
+  check('own queryable answers own get', ownReplies.some((r) => r.ok && r.text() === 'from myself'),
+        JSON.stringify(ownReplies.map((r) => r.text())));
+  await ownQ.undeclare();
+  await ownSub.undeclare();
+
+  // Info and key expressions.
+  const info = await a.info();
+  check('info lists the router', info.zid === a.zid && info.routers.length === 1 && /^[0-9a-f]{32}$/.test(info.routers[0]),
+        JSON.stringify(info));
+  check('keyexpr intersects', await a.keyexpr.intersects('a/*/c', 'a/b/**') && !(await a.keyexpr.intersects('a/b', 'a/c')));
+  check('keyexpr includes', await a.keyexpr.includes('a/**', 'a/b/c') && !(await a.keyexpr.includes('a/b/c', 'a/**')));
+  check('keyexpr canonize', (await a.keyexpr.canonize('a/**/**/b')) === 'a/**/b');
+
+  // Everything sent just before close() still goes out (the close must not overtake the sends).
+  const tail = [];
+  const tailSub = await b.declareSubscriber('api/tail/**', () => tail.push(1));
+  const c = await Session.open({ connect, threads });
+  const cpub = await c.declarePublisher('api/tail/x', { congestionControl: 'block' });
+  await sleep(300);
+  await Promise.all(Array.from({ length: 1000 }, (_, i) => cpub.put(`tail ${i}`)));
+  await c.close();
+  await waitUntil(() => tail.length >= 1000, 5000);
+  check('puts right before close are delivered', tail.length === 1000, `${tail.length} of 1000`);
+  await tailSub.undeclare();
+
+  await a.close();
+  await b.close();
+}
+
+try {
+  await main();
+} catch (err) {
+  check('no exception', false, err?.stack ?? err);
+}
+console.log('RESULT ' + JSON.stringify({ ok: checks.every((c) => c.ok), checks }));
+</script>
+</body>
+</html>

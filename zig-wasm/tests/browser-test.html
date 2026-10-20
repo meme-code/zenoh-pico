@@ -14,6 +14,7 @@ import { Session } from './zenoh.js';
 
 const params = new URLSearchParams(location.search);
 const connect = params.get('connect') ?? 'ws/127.0.0.1:10000';
+const threads = params.get('threads') === '1';
 const checks = [];
 const metrics = {};
 
@@ -34,9 +35,9 @@ async function main() {
   check('page is cross-origin isolated', crossOriginIsolated);
 
   let t0 = performance.now();
-  const a = await Session.open({ connect });
+  const a = await Session.open({ connect, threads });
   metrics.openMs = Math.round(performance.now() - t0);
-  const b = await Session.open({ connect });
+  const b = await Session.open({ connect, threads });
   check('two sessions opened', a.zid && b.zid, `${a.zid} ${b.zid}`);
   check('session ids differ', a.zid !== b.zid);
   // zw_zid prints the last byte first, so an id with only its first byte random looks like 000…0xx.

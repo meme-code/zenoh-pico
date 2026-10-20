@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>zenoh-pico C programs test</title>
+</head>
+<body>
+<pre id="out"></pre>
+<script type="module">
+// C programs in the browser: tests/threads-test.c, then pairs of upstream examples
+// (examples/unix/c11, unmodified) talking to each other through a real router.
+// Driven by tests/run-browser-test.mjs; reports a single console line: "RESULT {json}".
+import { Session, runProgram } from './zenoh.js';
+
+const params = new URLSearchParams(location.search);
+const locator = params.get('connect') ?? 'ws/127.0.0.1:10000';
+const checks = [];
+
+function check(name, ok, detail = '') {
+  checks.push({ name, ok: !!ok, detail: String(detail) });
+  document.getElementById('out').textContent += `${ok ? 'PASS' : 'FAIL'} ${name} ${detail}\n`;
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Starts a program; `out` collects its output lines as they come.
+async function start(wasm, args) {
+  const out = [];
+  const name = wasm.split('/').pop();
+  const program = await runProgram({
+    wasmUrl: wasm,
+    args,
+    onStdout: (line) => out.push(line),
+    onStderr: (line) => out.push(`stderr: ${line}`),
+  });
+  let code = null;
+  program.exited.then((c) => (code = c));
+  return {
+    out,
+    program,
+    get code() { return code; },
+    async waitFor(pattern, ms = 10000) {
+      const end = performance.now() + ms;
+      while (performance.now() < end && code === null && !out.some((l) => pattern.test(l))) await sleep(20);
+      return out.some((l) => pattern.test(l));
+    },
+    async exit(ms = 10000) {
+      return Promise.race([program.exited, sleep(ms).then(() => null)]);
+    },
+    tail: () => `${name}: ${out.slice(-4).join(' | ')}`,
+  };
+}
+
+const ex = (name) => `examples/${name}.wasm`;
+const e = ['-e', locator];
+
+async function main() {
+  // pthreads, TLS, heap and two threaded sessions (client + peer).
+  const t = await start('apps/threads-test.wasm', [locator]);
+  const tCode = await t.exit(60000);
+  for (const line of t.out) {
+    const m = /^(PASS|FAIL)  (.*)$/.exec(line);
+    if (m) check(`threads-test: ${m[2]}`, m[1] === 'PASS');
+  }
+  check('threads-test exits with 0', tCode === 0, t.tail());
+
+  // A single-threaded program that closes right after a batched burst: nothing may be lost.
+  const BURST = 10000;
+  const receiver = await Session.open({ connect: locator });
+  let got = 0;
+  await receiver.declareSubscriber('prog/burst', () => got++);
+  await sleep(300);
+  const burst = await start('apps/burst-close-st.wasm', [locator, String(BURST)]);
+  const burstCode = await burst.exit(15000);
+  const end = performance.now() + 5000;
+  while (got < BURST && performance.now() < end) await sleep(20);
+  await receiver.close();
+  check('a burst sent right before closing is delivered', burstCode === 0 && got === BURST, `${got} of ${BURST}`);
+
+  // z_sub <- z_pub
+  const sub = await start(ex('z_sub'), [...e, '-k', 'prog/pubsub/**', '-n', '3']);
+  await sub.waitFor(/Press CTRL-C to quit/);
+  const pub = await start(ex('z_pub'), [...e, '-k', 'prog/pubsub/x', '-n', '3', '-v', 'from z_pub']);
+  const subCode = await sub.exit(15000);
+  await pub.exit(15000);
+  check('z_sub receives z_pub (3 samples, then exits)',
+        subCode === 0 && sub.out.filter((l) => /Received \('prog\/pubsub\/x': '\[\s*\d+\] from z_pub'\)/.test(l)).length === 3,
+        sub.tail());
+
+  // z_queryable <- z_get
+  const queryable = await start(ex('z_queryable'), [...e, '-k', 'prog/query', '-v', 'from z_queryable', '-n', '1']);
+  await queryable.waitFor(/Press CTRL-C to quit/);
+  const get = await start(ex('z_get'), [...e, '-k', 'prog/query']);
+  const getCode = await get.exit(15000);
+  await queryable.exit(5000);
+  check('z_get gets z_queryable\'s reply', getCode === 0 &&
+        get.out.some((l) => /Received PUT \('prog\/query': 'from z_queryable'\)/.test(l)) &&
+        get.out.some((l) => /final notification/.test(l)), get.tail());
+
+  // z_liveliness <- z_get_liveliness
+  const token = await start(ex('z_liveliness'), [...e, '-k', 'prog/alive/x', '-t', '10']);
+  await token.waitFor(/Press CTRL-C/);
+  await sleep(300);
+  const lget = await start(ex('z_get_liveliness'), [...e, '-k', 'prog/alive/**']);
+  const lgetCode = await lget.exit(15000);
+  token.program.kill();
+  check('z_get_liveliness sees z_liveliness\'s token', lgetCode === 0 &&
+        lget.out.some((l) => l.includes('prog/alive/x')), lget.tail());
+
+  // z_pong <- z_ping; z_pong quits on 'q' from stdin.
+  const pong = await start(ex('z_pong'), e);
+  await pong.waitFor(/press 'q' to quit/);
+  const ping = await start(ex('z_ping'), [...e, '-n', '50', '-w', '100', '-s', '64']);
+  const pingCode = await ping.exit(30000);
+  pong.program.stdin.write('q\n');
+  const pongCode = await pong.exit(5000);
+  check('z_ping measures 50 round trips through z_pong', pingCode === 0 &&
+        ping.out.filter((l) => /^\d+$/.test(l)).length === 50, ping.tail());
+  check('z_pong reads "q" from stdin and exits', pongCode === 0, pong.tail());
+
+  // Single-threaded example (zp_spin_once loop) in a threaded build, fed by z_put.
+  const subSt = await start(ex('z_sub_st'), [...e, '-k', 'prog/st/**', '-n', '2']);
+  await subSt.waitFor(/Press CTRL-C to quit/);
+  await sleep(300);
+  for (let i = 0; i < 2; i++) {
+    const put = await start(ex('z_put'), [...e, '-k', 'prog/st/x', '-v', `put ${i}`]);
+    await put.exit(10000);
+  }
+  const subStCode = await subSt.exit(10000);
+  check('z_sub_st receives z_put twice', subStCode === 0 && subSt.out.filter((l) => /Received \('prog\/st\/x'/.test(l)).length === 2,
+        subSt.tail());
+
+  // Unstable API: querier, advanced pub/sub with history.
+  const q2 = await start(ex('z_queryable'), [...e, '-k', 'prog/querier', '-v', 'for the querier']);
+  await q2.waitFor(/Press CTRL-C to quit/);
+  const querier = await start(ex('z_querier'), [...e, '-s', 'prog/querier']);
+  const querierOk = await querier.waitFor(/Received \('prog\/querier': 'for the querier'\)/, 10000);
+  querier.program.kill();
+  q2.program.kill();
+  check('z_querier gets answers', querierOk, querier.tail());
+
+  const advPub = await start(ex('z_advanced_pub'), [...e, '-k', 'prog/adv/x', '-v', 'advanced']);
+  await advPub.waitFor(/Putting Data/, 10000);
+  await sleep(1500);
+  const advSub = await start(ex('z_advanced_sub'), [...e, '-k', 'prog/adv/**']);
+  const advOk = await advSub.waitFor(/Received PUT \('prog\/adv\/x'/, 15000);
+  advSub.program.kill();
+  advPub.program.kill();
+  check('z_advanced_sub receives z_advanced_pub (with history)', advOk, advSub.tail());
+
+  // Session info and pure serialization.
+  const info = await start(ex('z_info'), e);
+  const infoOk = await info.waitFor(/Routers IDs:/, 10000) && await info.waitFor(/^ [0-9a-f]{32}$/, 3000);
+  info.program.kill();
+  check('z_info lists the router', infoOk, info.tail());
+  const bytes = await start(ex('z_bytes'), []);
+  check('z_bytes exits with 0', (await bytes.exit(10000)) === 0, bytes.tail());
+}
+
+try {
+  await main();
+} catch (err) {
+  check('no exception', false, err?.stack ?? err);
+}
+console.log('RESULT ' + JSON.stringify({ ok: checks.every((c) => c.ok), checks }));
+</script>
+</body>
+</html>

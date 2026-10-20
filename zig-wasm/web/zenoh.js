@@ -5,11 +5,17 @@
 //   await session.declareSubscriber('demo/**', (sample) => console.log(sample.keyexpr, sample.text()));
 //   await session.put('demo/hello', 'world');
 //
-// Each Session runs zenoh-pico in its own Web Worker and owns that worker's WebSockets.
-// The page must be cross-origin isolated (COOP: same-origin, COEP: require-corp) because
-// the worker blocks on SharedArrayBuffer + Atomics.wait; see tools/serve.py.
+// and for C programs built with `zig build app` (or the upstream examples):
+//
+//   import { runProgram } from './zenoh.js';
+//   const program = await runProgram({ wasmUrl: 'examples/z_sub.wasm', args: ['-e', 'ws/127.0.0.1:10000'] });
+//   const exitCode = await program.exited;
+//
+// Each Session or program runs zenoh-pico in Web Workers (one per thread) on one shared
+// memory; the page owns their WebSockets. The page must be cross-origin isolated
+// (COOP: same-origin, COEP: require-corp) because of that SharedArrayBuffer; see tools/serve.py.
 
-import { CTRL, RING, SOCK_STATE } from './zenoh-shared.js';
+import { Runtime, defaultWsUrl, loadWasm } from './zenoh-runtime.js';
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -37,31 +43,31 @@ export class ZenohError extends Error {
     }
 }
 
-export class Sample {
-    constructor({ keyexpr, kind, payload, encoding }) {
-        this.keyexpr = keyexpr;
-        this.kind = kind === 1 ? 'delete' : 'put';
-        this.payload = payload;
-        this.encoding = encoding;
-    }
+/*------------------ Options ------------------*/
 
-    text() {
-        return decoder.decode(this.payload);
-    }
+const PRIORITIES = {
+    'real-time': 1, 'interactive-high': 2, 'interactive-low': 3, 'data-high': 4, data: 5, 'data-low': 6, background: 7,
+};
+const PRIORITY_NAMES = Object.fromEntries(Object.entries(PRIORITIES).map(([k, v]) => [v, k]));
+const CONGESTION_CONTROLS = { drop: 0, block: 1 };
+const RELIABILITIES = { reliable: 0, 'best-effort': 1 };
+const TARGETS = { 'best-matching': 0, all: 1, 'all-complete': 2 };
+const CONSOLIDATIONS = { auto: -1, none: 0, monotonic: 1, latest: 2 };
+const UNSET = -1;
+const UNSET_CONSOLIDATION = -2147483648;
+
+function lookup(table, value, what, unset = UNSET) {
+    if (value === undefined || value === null) return unset;
+    if (typeof value === 'number' && Object.values(table).includes(value)) return value;
+    if (value in table) return table[value];
+    throw new TypeError(`unknown ${what} ${JSON.stringify(value)}; expected one of ${Object.keys(table).join(', ')}`);
 }
 
-export class Reply {
-    constructor({ ok, keyexpr, payload, encoding }) {
-        this.ok = ok;
-        this.keyexpr = keyexpr;
-        this.payload = payload;
-        this.encoding = encoding;
-    }
-
-    text() {
-        return decoder.decode(this.payload);
-    }
-}
+const qos = ({ congestionControl, priority, express } = {}) => [
+    lookup(CONGESTION_CONTROLS, congestionControl, 'congestionControl'),
+    lookup(PRIORITIES, priority, 'priority'),
+    express === undefined ? UNSET : express ? 1 : 0,
+];
 
 function toBytes(payload) {
     if (typeof payload === 'string') return encoder.encode(payload);
@@ -71,94 +77,184 @@ function toBytes(payload) {
     throw new TypeError('payload must be a string, ArrayBuffer or typed array');
 }
 
-function defaultWsUrl(host, port) {
-    const secure = globalThis.location?.protocol === 'https:';
-    const h = host.includes(':') ? `[${host}]` : host;
-    return `${secure ? 'wss' : 'ws'}://${h}:${port}/`;
+// (bytes, has) argument pair for optional byte arguments such as attachments.
+const optionalBytes = (value) => (value === undefined || value === null ? [new Uint8Array(0), false] : [toBytes(value), true]);
+
+/*------------------ Data ------------------*/
+
+/** NTP64 time (seconds since 1970 in the high 32 bits, fraction in the low 32) to ms. */
+function ntp64ToMs(ntp64) {
+    return Number(ntp64 >> 32n) * 1000 + (Number(ntp64 & 0xffffffffn) / 2 ** 32) * 1000;
 }
 
-const moduleCache = new Map();
-
-function compileWasm(url) {
-    const key = String(url);
-    if (!moduleCache.has(key)) {
-        const promise = WebAssembly.compileStreaming(fetch(key)).catch(async () => {
-            // Some servers don't send application/wasm; compile from bytes instead.
-            const res = await fetch(key);
-            if (!res.ok) throw new Error(`fetching ${key}: HTTP ${res.status}`);
-            return WebAssembly.compile(await res.arrayBuffer());
-        });
-        moduleCache.set(key, promise);
-        promise.catch(() => moduleCache.delete(key));
+export class Sample {
+    constructor(msg) {
+        this.keyexpr = msg.keyexpr;
+        this.kind = msg.kind === 1 ? 'delete' : 'put';
+        this.payload = msg.payload;
+        this.encoding = msg.encoding;
+        this.attachment = msg.attachment;
+        this.priority = PRIORITY_NAMES[msg.priority] ?? null;
+        this.congestionControl = msg.congestionControl === 1 ? 'block' : msg.congestionControl === 0 ? 'drop' : null;
+        this.express = msg.express < 0 ? null : msg.express === 1;
+        this.timestamp = msg.timestamp ? { ms: ntp64ToMs(msg.timestamp.ntp64), ntp64: msg.timestamp.ntp64, id: msg.timestamp.id } : null;
     }
-    return moduleCache.get(key);
+
+    text() {
+        return decoder.decode(this.payload);
+    }
 }
 
-export class Subscriber {
-    #session;
-    #id;
+export class Reply {
+    constructor(msg) {
+        this.ok = msg.kind === 1;
+        this.keyexpr = msg.keyexpr;
+        this.payload = msg.payload;
+        this.encoding = msg.encoding;
+        this.attachment = msg.attachment;
+        this.sample = this.ok ? new Sample({ ...msg, kind: 0 }) : null;
+    }
 
-    constructor(session, id, keyexpr) {
+    text() {
+        return decoder.decode(this.payload);
+    }
+}
+
+export class Query {
+    #session;
+    #handle;
+    #finished = false;
+
+    constructor(session, handle, msg) {
         this.#session = session;
-        this.#id = id;
+        this.#handle = handle;
+        this.keyexpr = msg.keyexpr;
+        this.parameters = msg.parameters;
+        this.payload = msg.hasPayload ? msg.payload : null;
+        this.encoding = msg.encoding;
+        this.attachment = msg.attachment;
+    }
+
+    text() {
+        return this.payload ? decoder.decode(this.payload) : '';
+    }
+
+    async reply(keyexpr, payload, { encoding = '', attachment } = {}) {
+        await this.#session._call('queryReply', `reply on ${keyexpr}`, this.#handle, keyexpr, toBytes(payload), encoding,
+            ...optionalBytes(attachment));
+    }
+
+    async replyErr(payload, { encoding = '' } = {}) {
+        await this.#session._call('queryReplyErr', 'reply error', this.#handle, toBytes(payload), encoding);
+    }
+
+    async replyDelete(keyexpr, { attachment } = {}) {
+        await this.#session._call('queryReplyDel', `reply delete on ${keyexpr}`, this.#handle, keyexpr,
+            ...optionalBytes(attachment));
+    }
+
+    /** @internal Ends the query: the querier gets its final reply. */
+    async _finish() {
+        if (this.#finished) return;
+        this.#finished = true;
+        await this.#session._callRaw('queryDrop', this.#handle);
+    }
+}
+
+/*------------------ Entities ------------------*/
+
+class Entity {
+    constructor(session, handle, undeclareMethod, keyexpr) {
+        this._session = session;
+        this._handle = handle;
+        this._undeclareMethod = undeclareMethod;
         this.keyexpr = keyexpr;
     }
 
     async undeclare() {
-        await this.#session._undeclareSubscriber(this.#id);
+        if (this._handle === null) return;
+        const handle = this._handle;
+        this._handle = null;
+        this._session._forget(this);
+        await this._session._call(this._undeclareMethod, `undeclare ${this.keyexpr ?? ''}`, handle);
     }
 }
 
-export class Publisher {
-    #session;
-    #id;
+export class Subscriber extends Entity {}
 
-    constructor(session, id, keyexpr) {
-        this.#session = session;
-        this.#id = id;
-        this.keyexpr = keyexpr;
+export class Queryable extends Entity {}
+
+export class LivelinessToken extends Entity {}
+
+export class MatchingListener extends Entity {}
+
+export class Publisher extends Entity {
+    async put(payload, { encoding = '', attachment } = {}) {
+        await this._session._call('publisherPut', `put ${this.keyexpr}`, this._handle, toBytes(payload), encoding,
+            ...optionalBytes(attachment));
     }
 
-    async put(payload, { encoding = '' } = {}) {
-        await this.#session._call('publisherPut', 'publisher put', this.#id, toBytes(payload), encoding);
+    async delete() {
+        await this._session._call('publisherDelete', `delete ${this.keyexpr}`, this._handle);
     }
 
-    async undeclare() {
-        await this.#session._call('undeclarePublisher', 'undeclare publisher', this.#id);
+    /** Whether subscribers currently match this publisher. */
+    async matchingStatus() {
+        return (await this._session._call('publisherMatchingStatus', 'matching status', this._handle)) === 1;
+    }
+
+    /** @param {(matching: boolean) => void} handler called whenever the matching status changes */
+    async declareMatchingListener(handler) {
+        return this._session._declare(MatchingListener, 'declareMatchingListener', 'undeclareMatchingListener',
+            'declare matching listener', null, handler, (id) => [id, this._handle]);
     }
 }
+
+export class Querier extends Entity {
+    /** Like Session.get, for the querier's key expression and options. */
+    async get(parameters = '', { payload, encoding = '', attachment, onReply } = {}) {
+        return this._session._query(`get ${this.keyexpr}`, onReply, (id) => [
+            'querierGet', this._handle, id, parameters, ...optionalBytes(payload), encoding, ...optionalBytes(attachment),
+        ]);
+    }
+}
+
+/*------------------ Session ------------------*/
 
 export class Session {
-    #worker;
-    #ctrl;
-    #wsUrl;
+    #runtime;
     #nextCall = 0;
     #calls = new Map();
-    #sockets = new Map();
-    #subscribers = new Map();
-    #nextGet = 0;
-    #gets = new Map();
+    #nextId = 1;
+    #handlers = new Map();   // callback id -> handler (subscribers, queryables, matching listeners)
+    #queries = new Map();    // callback id -> { replies, onReply, resolve }
+    #entities = new Set();
     #closed = false;
+    #threads;
 
     /** Called with no arguments if the session ends without close() (e.g. the lease expired). */
     onclose = null;
 
     /**
-     * Opens a client session.
+     * Opens a session.
      *
      * @param {object} options
-     * @param {string} [options.connect='ws/127.0.0.1:10000'] zenoh locator of a router's WebSocket listener
-     * @param {(host: string, port: string) => string} [options.wsUrl] maps the locator to a WebSocket URL
+     * @param {string|string[]} [options.connect='ws/127.0.0.1:10000'] zenoh locator(s) of WebSocket listeners
+     * @param {'client'|'peer'} [options.mode='client'] peer mode needs `threads`
+     * @param {boolean} [options.threads=false] run zenoh-pico's own tasks on threads
+     *   (zenoh-pico-mt.wasm) instead of between calls on one worker (zenoh-pico.wasm)
+     * @param {(host: string, port: string) => string} [options.wsUrl] maps a locator to a WebSocket URL
      *   (default: ws:// on http pages, wss:// on https pages)
-     * @param {string|URL} [options.wasmUrl] location of zenoh-pico.wasm
+     * @param {string|URL} [options.wasmUrl] location of the wasm (default: next to this file)
      * @param {string|URL} [options.workerUrl] location of zenoh-worker.js
      */
     static async open(options = {}) {
-        const { connect = 'ws/127.0.0.1:10000' } = options;
+        const { connect = 'ws/127.0.0.1:10000', mode = 'client' } = options;
+        const locators = Array.isArray(connect) ? connect.join(',') : connect;
         const session = await Session._spawn(options);
         try {
-            await session._call('open', `open ${connect}`, connect);
-            session.zid = await session.#callRaw('zid');
+            await session._call('open', `open ${locators}`, locators, mode);
+            session.zid = await session._callRaw('zid');
         } catch (err) {
             session.#teardown();
             throw err;
@@ -167,24 +263,24 @@ export class Session {
     }
 
     /**
-     * @internal Starts the worker and wasm instance without opening a session. Any extra
+     * @internal Starts the workers and wasm instance without opening a session. Any extra
      * `zw_<name>` export of a custom wasm can then be called with `_call('<name>', ...)`
      * (the benchmark uses this for `zw_bench`).
      */
     static async _spawn({
+        threads = false,
         wsUrl = defaultWsUrl,
-        wasmUrl = new URL('./zenoh-pico.wasm', import.meta.url),
+        wasmUrl = new URL(threads ? './zenoh-pico-mt.wasm' : './zenoh-pico.wasm', import.meta.url),
         workerUrl = new URL('./zenoh-worker.js', import.meta.url),
     } = {}) {
-        if (!globalThis.crossOriginIsolated) {
-            throw new Error(
-                'zenoh-pico needs a cross-origin isolated page (SharedArrayBuffer). Serve it with ' +
-                '"Cross-Origin-Opener-Policy: same-origin" and "Cross-Origin-Embedder-Policy: require-corp".');
-        }
-        const module = await compileWasm(wasmUrl);
-        const session = new Session(new Worker(workerUrl, { type: 'module' }), wsUrl);
+        const wasm = await loadWasm(wasmUrl);
+        const session = new Session();
+        session.#threads = wasm.threads;
+        session.#runtime = new Runtime({
+            role: 'session', wasm, workerUrl, wsUrl, onEvent: (msg) => session.#onEvent(msg),
+        });
         try {
-            await session.#init(module);
+            await session.#runtime.ready;
         } catch (err) {
             session.#teardown();
             throw err;
@@ -192,111 +288,158 @@ export class Session {
         return session;
     }
 
-    constructor(worker, wsUrl) {
-        this.#worker = worker;
-        this.#wsUrl = wsUrl;
-        this.#ctrl = new Int32Array(new SharedArrayBuffer(CTRL.INTS * 4));
+    constructor() {
         this.zid = null;
+        this.liveliness = new Liveliness(this);
+        this.keyexpr = new KeyExprs(this);
     }
 
-    #init(module) {
-        return new Promise((resolve, reject) => {
-            this.#worker.onmessage = ({ data }) => {
-                if (data.type === 'ready') {
-                    this.#worker.onmessage = ({ data: msg }) => this.#onWorkerMessage(msg);
-                    // A crashed worker must not leave calls pending forever.
-                    this.#worker.onerror = (ev) => {
-                        console.error('zenoh: worker failed', ev.message);
-                        if (!this.#closed) {
-                            this.#teardown();
-                            this.onclose?.();
-                        }
-                    };
-                    resolve();
-                } else if (data.type === 'init-error') {
-                    reject(new Error(data.message));
-                }
-            };
-            this.#worker.onerror = (ev) => reject(new Error(ev.message ?? 'zenoh worker failed to start'));
-            this.#worker.postMessage({ type: 'init', module, ctrl: this.#ctrl.buffer });
-        });
+    /** Whether zenoh-pico runs on its own threads in this session. */
+    get threads() {
+        return this.#threads;
     }
 
-    #wake() {
-        Atomics.add(this.#ctrl, CTRL.WAKE, 1);
-        Atomics.notify(this.#ctrl, CTRL.WAKE);
-    }
-
-    #callRaw(method, ...args) {
+    /** @internal */
+    _callRaw(method, ...args) {
         if (this.#closed && method !== 'close') return Promise.reject(new ZenohError(method, -73));
         const id = this.#nextCall++;
         return new Promise((resolve, reject) => {
             this.#calls.set(id, { resolve, reject });
-            this.#worker.postMessage({ type: 'call', id, method, args });
-            // The worker may be parked in an idle read; let it return to its event loop.
-            Atomics.store(this.#ctrl, CTRL.INTERRUPT, 1);
-            this.#wake();
+            this.#runtime.post({ type: 'call', id, method, args });
+            // A single-threaded worker may be parked in a read inside zw_spin; let it return.
+            if (!this.#threads) this.#runtime.interrupt();
         });
     }
 
     /** @internal Calls a worker method whose result is a z_result_t, or a handle when >= 0. */
     async _call(method, operation, ...args) {
-        const res = await this.#callRaw(method, ...args);
-        if (res < 0) throw new ZenohError(operation, res);
+        const res = await this._callRaw(method, ...args);
+        if (typeof res === 'number' && res < 0) throw new ZenohError(operation, res);
         return res;
     }
 
-    async put(keyexpr, payload, { encoding = '' } = {}) {
-        await this._call('put', `put ${keyexpr}`, keyexpr, toBytes(payload), encoding);
+    /** @internal Declares an entity whose callbacks are routed by an id chosen here. */
+    async _declare(Class, method, undeclareMethod, operation, keyexpr, handler, makeArgs) {
+        const id = this.#nextId++;
+        if (handler) this.#handlers.set(id, handler);
+        try {
+            const handle = await this._call(method, operation, ...makeArgs(id));
+            const entity = new Class(this, handle, undeclareMethod, keyexpr);
+            entity._id = id;
+            this.#entities.add(entity);
+            return entity;
+        } catch (err) {
+            this.#handlers.delete(id);
+            throw err;
+        }
     }
 
-    async delete(keyexpr) {
-        await this._call('delete', `delete ${keyexpr}`, keyexpr);
+    /** @internal */
+    _forget(entity) {
+        this.#entities.delete(entity);
+        this.#handlers.delete(entity._id);
+    }
+
+    /** @internal Runs a query; resolves with all replies once it is complete. */
+    async _query(operation, onReply, makeCall) {
+        const id = this.#nextId++;
+        const replies = [];
+        const done = new Promise((resolve) => this.#queries.set(id, { replies, onReply, resolve }));
+        try {
+            const [method, ...args] = makeCall(id);
+            await this._call(method, operation, ...args);
+        } catch (err) {
+            this.#queries.delete(id);
+            throw err;
+        }
+        return done;
+    }
+
+    /**
+     * @param {string} keyexpr
+     * @param {string|Uint8Array|ArrayBuffer} payload
+     * @param {object} [options] encoding, attachment, congestionControl ('drop'|'block'),
+     *   priority ('real-time' ... 'background' or 1-7), express
+     */
+    async put(keyexpr, payload, options = {}) {
+        const { encoding = '', attachment } = options;
+        await this._call('put', `put ${keyexpr}`, keyexpr, toBytes(payload), encoding, ...optionalBytes(attachment),
+            ...qos(options));
+    }
+
+    async delete(keyexpr, options = {}) {
+        await this._call('delete', `delete ${keyexpr}`, keyexpr, ...qos(options));
     }
 
     /** @param {(sample: Sample) => void} handler */
     async declareSubscriber(keyexpr, handler) {
-        const id = await this._call('declareSubscriber', `declare subscriber ${keyexpr}`, keyexpr);
-        this.#subscribers.set(id, handler);
-        return new Subscriber(this, id, keyexpr);
+        return this._declare(Subscriber, 'declareSubscriber', 'undeclareSubscriber', `declare subscriber ${keyexpr}`,
+            keyexpr, handler, (id) => [id, keyexpr, 0, 0]);
     }
 
-    /** @internal */
-    async _undeclareSubscriber(id) {
-        this.#subscribers.delete(id);
-        await this._call('undeclareSubscriber', 'undeclare subscriber', id);
+    /**
+     * @param {object} [options] encoding, congestionControl, priority, express,
+     *   reliability ('reliable'|'best-effort', needs the unstable API)
+     */
+    async declarePublisher(keyexpr, options = {}) {
+        const { encoding = '', reliability } = options;
+        return this._declare(Publisher, 'declarePublisher', 'undeclarePublisher', `declare publisher ${keyexpr}`,
+            keyexpr, null, () => [keyexpr, encoding, ...qos(options), lookup(RELIABILITIES, reliability, 'reliability')]);
     }
 
-    async declarePublisher(keyexpr) {
-        const id = await this._call('declarePublisher', `declare publisher ${keyexpr}`, keyexpr);
-        return new Publisher(this, id, keyexpr);
+    /**
+     * Answers queries on `keyexpr`. The handler gets a Query to reply to (possibly several
+     * times); the query is finished when the handler returns, or when its promise settles.
+     *
+     * @param {(query: Query) => void | Promise<void>} handler
+     * @param {object} [options]
+     * @param {boolean} [options.complete=false]
+     */
+    async declareQueryable(keyexpr, handler, { complete = false } = {}) {
+        return this._declare(Queryable, 'declareQueryable', 'undeclareQueryable', `declare queryable ${keyexpr}`,
+            keyexpr, handler, (id) => [id, keyexpr, complete]);
     }
 
     /**
      * Queries `keyexpr` and resolves with every reply once the query completes.
      * @param {object} [options]
      * @param {string} [options.parameters]
+     * @param {string|Uint8Array} [options.payload]
+     * @param {string} [options.encoding]
+     * @param {string|Uint8Array} [options.attachment]
+     * @param {'best-matching'|'all'|'all-complete'} [options.target]
+     * @param {'auto'|'none'|'monotonic'|'latest'} [options.consolidation]
      * @param {number} [options.timeoutMs] 0 uses zenoh-pico's default
      * @param {(reply: Reply) => void} [options.onReply] called for each reply as it arrives
      * @returns {Promise<Reply[]>}
      */
-    async get(keyexpr, { parameters = '', timeoutMs = 0, onReply } = {}) {
-        const id = this.#nextGet++;
-        const replies = [];
-        const done = new Promise((resolve) => this.#gets.set(id, { replies, onReply, resolve }));
-        try {
-            await this._call('get', `get ${keyexpr}`, id, keyexpr, parameters, timeoutMs);
-        } catch (err) {
-            this.#gets.delete(id);
-            throw err;
-        }
-        return done;
+    async get(keyexpr, options = {}) {
+        const { parameters = '', payload, encoding = '', attachment, target, consolidation, timeoutMs = 0, onReply } = options;
+        return this._query(`get ${keyexpr}`, onReply, (id) => [
+            'get', id, keyexpr, parameters, ...optionalBytes(payload), encoding, ...optionalBytes(attachment),
+            lookup(TARGETS, target, 'target'), lookup(CONSOLIDATIONS, consolidation, 'consolidation', UNSET_CONSOLIDATION),
+            timeoutMs, ...qos(options),
+        ]);
+    }
+
+    /** A declared querier: repeated gets on one key expression with fixed options. */
+    async declareQuerier(keyexpr, options = {}) {
+        const { target, consolidation, timeoutMs = 0 } = options;
+        return this._declare(Querier, 'declareQuerier', 'undeclareQuerier', `declare querier ${keyexpr}`, keyexpr, null,
+            () => [keyexpr, lookup(TARGETS, target, 'target'),
+                lookup(CONSOLIDATIONS, consolidation, 'consolidation', UNSET_CONSOLIDATION), timeoutMs, ...qos(options)]);
+    }
+
+    /** This session's id and those of the routers and peers it is connected to. */
+    async info() {
+        const [routers, peers] = await Promise.all([this._call('info', 'info', false), this._call('info', 'info', true)]);
+        return { zid: this.zid, routers, peers };
     }
 
     async close() {
         if (this.#closed) return;
         try {
-            await this.#callRaw('close');
+            await this._callRaw('close');
         } finally {
             this.#teardown();
         }
@@ -304,16 +447,34 @@ export class Session {
 
     #teardown() {
         this.#closed = true;
-        this.#worker.terminate();
-        for (const { ws } of this.#sockets.values()) ws?.close();
-        this.#sockets.clear();
+        this.#runtime?.terminate();
         for (const { reject } of this.#calls.values()) reject(new ZenohError('call', -73));
         this.#calls.clear();
-        for (const { replies, resolve } of this.#gets.values()) resolve(replies);
-        this.#gets.clear();
+        for (const { replies, resolve } of this.#queries.values()) resolve(replies);
+        this.#queries.clear();
+        this.#handlers.clear();
     }
 
-    #onWorkerMessage(msg) {
+    #invoke(what, fn) {
+        try {
+            const res = fn();
+            if (res instanceof Promise) res.catch((err) => console.error(`zenoh: ${what} threw`, err));
+        } catch (err) {
+            console.error(`zenoh: ${what} threw`, err);
+        }
+    }
+
+    async #answer(handler, query) {
+        try {
+            await handler(query);
+        } catch (err) {
+            console.error('zenoh: queryable callback threw', err);
+        } finally {
+            query._finish().catch(() => {});
+        }
+    }
+
+    #onEvent(msg) {
         switch (msg.type) {
             case 'result': {
                 const call = this.#calls.get(msg.id);
@@ -327,54 +488,43 @@ export class Session {
                 call?.reject(new Error(msg.message));
                 break;
             }
-            case 'ws-open':
-                this.#openSocket(msg);
-                break;
-            case 'ws-send': {
-                const s = this.#sockets.get(msg.sock);
-                if (s?.ws.readyState === WebSocket.OPEN) s.ws.send(msg.data);
-                break;
-            }
-            case 'ws-close': {
-                const s = this.#sockets.get(msg.sock);
-                this.#sockets.delete(msg.sock);
-                s?.ws.close();
-                break;
-            }
             case 'sample': {
-                const handler = this.#subscribers.get(msg.sub);
-                if (handler) {
-                    try {
-                        handler(new Sample(msg));
-                    } catch (err) {
-                        console.error('zenoh: subscriber callback threw', err);
-                    }
-                }
+                const handler = this.#handlers.get(msg.id);
+                if (handler) this.#invoke('subscriber callback', () => handler(new Sample(msg.msg)));
+                break;
+            }
+            case 'query': {
+                const handler = this.#handlers.get(msg.id);
+                const query = new Query(this, msg.query, msg.msg);
+                if (handler) this.#answer(handler, query);
+                else query._finish().catch(() => {});
+                break;
+            }
+            case 'matching': {
+                const handler = this.#handlers.get(msg.id);
+                if (handler) this.#invoke('matching listener', () => handler(msg.matching));
                 break;
             }
             case 'reply': {
-                const get = this.#gets.get(msg.get);
-                if (get) {
-                    const reply = new Reply(msg);
-                    get.replies.push(reply);
-                    try {
-                        get.onReply?.(reply);
-                    } catch (err) {
-                        console.error('zenoh: onReply callback threw', err);
-                    }
+                const q = this.#queries.get(msg.id);
+                if (q) {
+                    const reply = new Reply(msg.msg);
+                    q.replies.push(reply);
+                    if (q.onReply) this.#invoke('onReply callback', () => q.onReply(reply));
                 }
                 break;
             }
             case 'reply-done': {
-                const get = this.#gets.get(msg.get);
-                this.#gets.delete(msg.get);
-                get?.resolve(get.replies);
+                const q = this.#queries.get(msg.id);
+                this.#queries.delete(msg.id);
+                q?.resolve(q.replies);
                 break;
             }
             case 'log':
                 (msg.fd === 2 ? console.error : console.log)(msg.line);
                 break;
             case 'closed':
+            case 'fatal':
                 if (!this.#closed) {
                     this.#teardown();
                     this.onclose?.();
@@ -382,65 +532,113 @@ export class Session {
                 break;
         }
     }
+}
 
-    #openSocket({ sock, host, port, ring }) {
-        const hdr = new Int32Array(ring, 0, RING.HEADER_BYTES / 4);
-        const data = new Uint8Array(ring, RING.HEADER_BYTES);
-        const setState = (state) => {
-            Atomics.store(hdr, RING.STATE, state);
-            this.#wake();
-        };
-        let ws;
-        try {
-            ws = new WebSocket(this.#wsUrl(host, port));
-        } catch (err) {
-            console.error('zenoh: cannot open WebSocket', err);
-            setState(SOCK_STATE.CLOSED);
-            return;
-        }
-        ws.binaryType = 'arraybuffer';
-        const s = { ws, hdr, data, pending: [], flushTimer: 0 };
-        this.#sockets.set(sock, s);
-        ws.onopen = () => setState(SOCK_STATE.OPEN);
-        ws.onclose = () => setState(SOCK_STATE.CLOSED);
-        ws.onerror = () => setState(SOCK_STATE.CLOSED);
-        ws.onmessage = ({ data: buf }) => {
-            if (!(buf instanceof ArrayBuffer)) return; // zenoh only sends binary frames
-            s.pending.push(new Uint8Array(buf));
-            this.#flush(s);
-        };
+class Liveliness {
+    #session;
+
+    constructor(session) {
+        this.#session = session;
     }
 
-    // Moves received messages into the socket's ring, retrying shortly if the worker is behind.
-    #flush(s) {
-        const mask = RING.CAPACITY - 1;
-        let wrote = false;
-        while (s.pending.length > 0) {
-            const msg = s.pending[0];
-            const need = 4 + msg.length;
-            if (need > RING.CAPACITY) {
-                console.error(`zenoh: dropping a ${msg.length}-byte message larger than the receive ring`);
-                s.pending.shift();
-                continue;
+    /** Announces that this session is alive on `keyexpr` until the token is undeclared. */
+    async declareToken(keyexpr) {
+        return this.#session._declare(LivelinessToken, 'livelinessDeclareToken', 'livelinessUndeclareToken',
+            `declare liveliness token ${keyexpr}`, keyexpr, null, () => [keyexpr]);
+    }
+
+    /**
+     * Samples are puts when a matching token appears and deletes when it goes away.
+     * @param {object} [options]
+     * @param {boolean} [options.history=false] also report the tokens that are already alive
+     */
+    async declareSubscriber(keyexpr, handler, { history = false } = {}) {
+        return this.#session._declare(Subscriber, 'declareSubscriber', 'undeclareSubscriber',
+            `declare liveliness subscriber ${keyexpr}`, keyexpr, handler, (id) => [id, keyexpr, 1, history]);
+    }
+
+    /** The liveliness tokens currently alive on `keyexpr`, as replies. */
+    async get(keyexpr, { timeoutMs = 0, onReply } = {}) {
+        return this.#session._query(`liveliness get ${keyexpr}`, onReply, (id) => ['livelinessGet', id, keyexpr, timeoutMs]);
+    }
+}
+
+class KeyExprs {
+    #session;
+
+    constructor(session) {
+        this.#session = session;
+    }
+
+    async intersects(a, b) {
+        return (await this.#session._call('keyexprRelation', 'key expression', a, b, 0)) === 1;
+    }
+
+    async includes(a, b) {
+        return (await this.#session._call('keyexprRelation', 'key expression', a, b, 1)) === 1;
+    }
+
+    async canonize(keyexpr) {
+        return this.#session._call('keyexprCanonize', `canonize ${keyexpr}`, keyexpr);
+    }
+}
+
+/*------------------ C programs ------------------*/
+
+/**
+ * Runs a zenoh-pico C program (a wasm with main(), from `zig build app` or the examples).
+ *
+ * @param {object} options
+ * @param {string|URL} options.wasmUrl
+ * @param {string[]} [options.args] command line arguments (argv[1..])
+ * @param {(line: string) => void} [options.onStdout] default: console.log
+ * @param {(line: string) => void} [options.onStderr] default: console.error
+ * @param {(host: string, port: string) => string} [options.wsUrl]
+ * @param {string|URL} [options.workerUrl]
+ * @returns {Promise<{exited: Promise<number>, stdin: {write(data: string|Uint8Array): void, end(): void}, kill(): void}>}
+ *   `exited` resolves with the exit code; kill() stops the program (exit code 137).
+ */
+export async function runProgram({
+    wasmUrl,
+    args = [],
+    onStdout = console.log,
+    onStderr = console.error,
+    wsUrl = defaultWsUrl,
+    workerUrl = new URL('./zenoh-worker.js', import.meta.url),
+}) {
+    const wasm = await loadWasm(wasmUrl);
+    const name = String(wasmUrl).split('/').pop().replace(/\.wasm$/, '');
+    let finish;
+    const exited = new Promise((resolve) => (finish = resolve));
+    let done = false;
+    const end = (code) => {
+        if (done) return;
+        done = true;
+        runtime.terminate();
+        finish(code);
+    };
+    const runtime = new Runtime({
+        role: 'program',
+        wasm,
+        workerUrl,
+        wsUrl,
+        args: [name, ...args],
+        onEvent(msg) {
+            if (msg.type === 'log') (msg.fd === 2 ? onStderr : onStdout)(msg.line);
+            else if (msg.type === 'exit') end(msg.code);
+            else if (msg.type === 'fatal') {
+                onStderr(`${name} crashed: ${msg.message}`);
+                end(134);
             }
-            const w = Atomics.load(s.hdr, RING.WRITE) >>> 0;
-            const r = Atomics.load(s.hdr, RING.READ) >>> 0;
-            if (RING.CAPACITY - ((w - r) >>> 0) < need) break;
-            for (let i = 0; i < 4; i++) s.data[(w + i) & mask] = (msg.length >>> (8 * i)) & 0xff;
-            const start = (w + 4) & mask;
-            const first = Math.min(msg.length, RING.CAPACITY - start);
-            s.data.set(msg.subarray(0, first), start);
-            s.data.set(msg.subarray(first), 0);
-            Atomics.store(s.hdr, RING.WRITE, (w + need) | 0);
-            s.pending.shift();
-            wrote = true;
-        }
-        if (wrote) this.#wake();
-        if (s.pending.length > 0 && !s.flushTimer) {
-            s.flushTimer = setTimeout(() => {
-                s.flushTimer = 0;
-                this.#flush(s);
-            }, 1);
-        }
-    }
+        },
+    });
+    await runtime.ready;
+    return {
+        exited,
+        stdin: {
+            write: (data) => runtime.writeStdin(data),
+            end: () => runtime.closeStdin(),
+        },
+        kill: () => end(137),
+    };
 }

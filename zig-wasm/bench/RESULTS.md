@@ -1,5 +1,9 @@
 # zenoh-pico in the browser: Zig port vs. Emscripten port
 
+> Measured on the first version of this port (commit 03c330d3: single-threaded only, WebSocket rings in
+> separate SharedArrayBuffers). The Zig numbers in `RESULTS-rust.md` are from the current version, which
+> keeps the rings in wasm memory and adds threads; its in-page Zig figures are in the same range.
+
 Measured 2026-10-09 on Apple M5, Darwin 25.6.0. Chrome/154.0.8037.98 (headless, background throttling off), zenohd 1.10.1, zenoh-pico 1.10.1-1-gd9b4eea4. Zig 0.17.0 (ReleaseFast), Emscripten 6.0.12 (-O3, Asyncify).
 
 Both pages run the same `bench/bench.c` against one local `zenohd` (WebSocket listener). The other end is

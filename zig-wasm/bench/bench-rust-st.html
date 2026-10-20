@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>zenoh bench: Rust (single thread)</title>
+</head>
+<body>
+<script src="rust/single/zenoh_rust_bench.js"></script>
+<script>
+// Runs bench/rust (bench.c's workload on the community Rust zenoh wasm port), the single-threaded build;
+// zenoh and the workload run on this page's event loop.
+const p = new URLSearchParams(location.search);
+const shim = new URL('rust/single/zenoh_rust_bench.js', location.href).href;
+(async () => {
+  await wasm_bindgen({ module_or_path: 'rust/single/zenoh_rust_bench_bg.wasm' });
+  await wasm_bindgen.bench(p.get('connect'), p.get('mode'), Number(p.get('n')), Number(p.get('size')), shim);
+})().catch((err) => console.error('bench failed', String(err)));
+</script>
+</body>
+</html>

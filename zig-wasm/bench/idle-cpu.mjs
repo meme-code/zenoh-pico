@@ -3,21 +3,23 @@
 // session with a subscriber and no traffic) and we sum the CPU time of all processes of this
 // Chrome instance between IDLE_START and IDLE_END. A blank page gives the baseline.
 //
-//   node bench/idle-cpu.mjs <state-file> <out.json> [seconds=10] [runs=3]
+//   node bench/idle-cpu.mjs <state-file> <out.json> [seconds=10] [runs=3] [ports=zig,emscripten]
 
 import { execFileSync } from 'node:child_process';
 import { readFileSync, writeFileSync } from 'node:fs';
 
 import { cleanupAll, connectChrome, failAndExit, openPage, sleep } from '../tools/headless.mjs';
+import { benchPages } from './ports.mjs';
 
-const [stateFile, outFile, secondsArg = '10', runsArg = '3'] = process.argv.slice(2);
+const [stateFile, outFile, secondsArg = '10', runsArg = '3', portsArg = 'zig,emscripten'] = process.argv.slice(2);
 if (!outFile) {
-    console.error('usage: idle-cpu.mjs <state-file> <out.json> [seconds] [runs]');
+    console.error('usage: idle-cpu.mjs <state-file> <out.json> [seconds] [runs] [ports]');
     process.exit(2);
 }
 const state = JSON.parse(readFileSync(stateFile, 'utf8'));
 const seconds = Number(secondsArg);
 const runs = Number(runsArg);
+const ports = portsArg.split(',');
 
 // Total CPU seconds (user+system) of every process whose command line names this profile dir.
 function chromeCpuSeconds() {
@@ -41,7 +43,7 @@ async function measurePort(port) {
         rejectDone = rej;
     });
     const params = new URLSearchParams({ connect: `ws/127.0.0.1:${state.wsPort}`, mode: 'idle', n: seconds * 1000, size: 0 });
-    const page = await openPage(cdp, `http://127.0.0.1:${state.httpPort}/bench-${port}.html?${params}`, (source, type, text) => {
+    const page = await openPage(cdp, `http://127.0.0.1:${state.httpPort}/${benchPages[port]}?${params}`, (source, type, text) => {
         if (text === 'IDLE_START') {
             startCpu = chromeCpuSeconds();
             startWall = performance.now();
@@ -75,11 +77,11 @@ async function measureBaseline() {
     return { cpuSeconds: cpu, wallSeconds: wall, cpuPercent: (100 * cpu) / wall };
 }
 
-const results = { seconds, runs, baseline: [], zig: [], emscripten: [] };
+const results = { seconds, runs, baseline: [], ...Object.fromEntries(ports.map((p) => [p, []])) };
 try {
     for (let i = 0; i < runs; i++) {
         results.baseline.push(await measureBaseline());
-        for (const port of ['zig', 'emscripten']) {
+        for (const port of ports) {
             const r = await measurePort(port);
             results[port].push(r);
             console.log(`idle ${port} run ${i + 1}/${runs}: ${r.cpuPercent.toFixed(1)}% of one core`);

@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>zenoh bench: Rust (worker pool)</title>
+</head>
+<body>
+<script src="rust/threads/zenoh_rust_bench.js"></script>
+<script>
+// Runs bench/rust (bench.c's workload on the community Rust zenoh wasm port), the port's SharedArrayBuffer worker pool;
+// the workload runs on its Application worker.
+const p = new URLSearchParams(location.search);
+const shim = new URL('rust/threads/zenoh_rust_bench.js', location.href).href;
+(async () => {
+  await wasm_bindgen({ module_or_path: 'rust/threads/zenoh_rust_bench_bg.wasm' });
+  await wasm_bindgen.bench(p.get('connect'), p.get('mode'), Number(p.get('n')), Number(p.get('size')), shim);
+})().catch((err) => console.error('bench failed', String(err)));
+</script>
+</body>
+</html>

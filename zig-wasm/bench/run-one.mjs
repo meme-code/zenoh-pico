@@ -1,27 +1,39 @@
 // One benchmark run; this is the command hyperfine times.
 //
-//   node bench/run-one.mjs <state-file> <zig|emscripten> <mode> <n> <size> <results.jsonl>
+//   node bench/run-one.mjs <state-file> <port> <mode> <n> <size> <results.jsonl>
+//
+// <port> is one of bench/ports.mjs (zig, emscripten, rust, rust-st).
 //
 // Opens the port's bench page in the running headless Chrome (bench/services.mjs), starts the
 // native peer the mode needs, waits until the work is done (the page's BENCH line, plus the
 // native peer's count for send modes), and appends the in-page metrics to results.jsonl. Exits non-zero if anything was
-// lost, so hyperfine stops instead of timing a broken run.
+// lost, so hyperfine stops instead of timing a broken run (or, with --ignore-failure, the run is
+// recorded in results.jsonl with its error).
 
 import { appendFileSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { cleanupAll, connectChrome, failAndExit, openPage, startProcess } from '../tools/headless.mjs';
+import { benchPages } from './ports.mjs';
 
 const [stateFile, port, mode, n, size, resultsFile] = process.argv.slice(2);
-if (!resultsFile || !['zig', 'emscripten'].includes(port)) {
-    console.error('usage: run-one.mjs <state-file> <zig|emscripten> <mode> <n> <size> <results.jsonl>');
+if (!resultsFile || !(port in benchPages)) {
+    console.error(`usage: run-one.mjs <state-file> <${Object.keys(benchPages).join('|')}> <mode> <n> <size> <results.jsonl>`);
     process.exit(2);
 }
 const state = JSON.parse(readFileSync(stateFile, 'utf8'));
 const peerBin = join(state.nativeDir, 'peer');
 const tcp = `tcp/127.0.0.1:${state.tcpPort}`;
 
-const fail = (message) => failAndExit(`run-one ${port} ${mode}: ${message}`);
+const record = (fields) => appendFileSync(resultsFile, JSON.stringify({
+    port, mode, n: Number(n), size: Number(size),
+    iteration: process.env.HYPERFINE_ITERATION ?? null,
+    ...fields,
+}) + '\n');
+const fail = (message) => {
+    record({ error: message });
+    failAndExit(`run-one ${port} ${mode}: ${message}`);
+};
 const timer = setTimeout(() => fail('timed out'), Number(process.env.BENCH_TIMEOUT_MS ?? 180_000));
 
 let peer = null;
@@ -51,7 +63,7 @@ const done = new Promise((resolve, reject) => {
 
 const cdp = await connectChrome(state.chromeWsUrl);
 const params = new URLSearchParams({ connect: `ws/127.0.0.1:${state.wsPort}`, mode, n, size });
-const page = await openPage(cdp, `http://127.0.0.1:${state.httpPort}/bench-${port}.html?${params}`,
+const page = await openPage(cdp, `http://127.0.0.1:${state.httpPort}/${benchPages[port]}?${params}`,
     (source, type, text) => onLine(source, type, text));
 
 let peerResult = null;
@@ -69,10 +81,6 @@ clearTimeout(timer);
 await page.close();
 cdp.close();
 
-appendFileSync(resultsFile, JSON.stringify({
-    port, mode, n: Number(n), size: Number(size),
-    iteration: process.env.HYPERFINE_ITERATION ?? null,
-    bench, peer: peerResult,
-}) + '\n');
+record({ bench, peer: peerResult });
 cleanupAll();
 process.exit(0);
